@@ -32,6 +32,7 @@ class BinLogEvent(object):
         enable_logging=False,
         use_column_name_cache=False,
         post_header_lengths=None,
+        json_update_mode=None,
     ):
         self.packet = from_packet
         self.table_map = table_map
@@ -48,6 +49,7 @@ class BinLogEvent(object):
         # the event will be skipped
         self._processed = True
         self.complete = True
+        self._json_update_mode = json_update_mode
         self._verify_event()
         self.dbms = self._ctl_connection._get_dbms()
 

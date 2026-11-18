@@ -10,7 +10,12 @@ from pymysqlreplication.constants.BINLOG import *
 from pymysqlreplication.constants.NONE_SOURCE import *
 from pymysqlreplication.event import *
 from pymysqlreplication.gtid import Gtid, GtidSet
-from pymysqlreplication.json_binary import JsonDiff, JsonDiffOperation
+from pymysqlreplication.json_binary import (
+    JsonDiff,
+    JsonDiffOperation,
+    JsonDiffVector,
+    JsonUpdateMode,
+)
 from pymysqlreplication.packet import BinLogPacketWrapper
 from pymysqlreplication.row_event import *
 from pymysqlreplication.tests import base
@@ -2147,10 +2152,14 @@ class TestJsonPartialUpdate(base.PyMySQLReplicationTestCase):
                     b"ab": [b"abababababababa", b"babababababab"],
                 },
             ),
-            after_value_c: JsonDiff = event.rows[0]["after_values"]["c"]
-            self.assertEqual(after_value_c.op, JsonDiffOperation.Replace)
-            self.assertEqual(after_value_c.path, b"$.ab")
-            self.assertEqual(after_value_c.value, b'["ab_updatedccc"]')
+            after_value_c: JsonDiffVector = event.rows[0]["after_values"]["c"]
+            self.assertIsInstance(after_value_c, JsonDiffVector)
+            self.assertEqual(len(after_value_c), 1)
+            self.assertEqual(after_value_c[0].op, JsonDiffOperation.Replace)
+            self.assertEqual(after_value_c[0].path, b"$.ab")
+            self.assertEqual(after_value_c[0].value, b'["ab_updatedccc"]')
+            # No base is materialized in the default DELTA mode.
+            self.assertTrue(after_value_c.is_pending_materialization)
 
             after_none_sources = event.rows[0].get("after_none_sources")
             self.assertEqual(after_none_sources["d"], NONE_SOURCE.JSON_PARTIAL_UPDATE)
@@ -2185,10 +2194,11 @@ class TestJsonPartialUpdate(base.PyMySQLReplicationTestCase):
                     b"ab": [b"abababababababa", b"babababababab"],
                 },
             ),
-            after_value_e: JsonDiff = event.rows[0]["after_values"]["e"]
-            self.assertEqual(after_value_e.op, JsonDiffOperation.Replace)
-            self.assertEqual(after_value_e.path, b"$.ab")
-            self.assertEqual(after_value_e.value, b'["ab_updatedeee"]')
+            after_value_e: JsonDiffVector = event.rows[0]["after_values"]["e"]
+            self.assertIsInstance(after_value_e, JsonDiffVector)
+            self.assertEqual(after_value_e[0].op, JsonDiffOperation.Replace)
+            self.assertEqual(after_value_e[0].path, b"$.ab")
+            self.assertEqual(after_value_e[0].value, b'["ab_updatedeee"]')
 
             after_none_sources = event.rows[0].get("after_none_sources")
             self.assertEqual(after_none_sources["c"], NONE_SOURCE.NULL)
@@ -2225,10 +2235,11 @@ class TestJsonPartialUpdate(base.PyMySQLReplicationTestCase):
                     b"ab": [b"abababababababa", b"babababababab"],
                 },
             ),
-            after_value_e: JsonDiff = event.rows[0]["after_values"]["e"]
-            self.assertEqual(after_value_e.op, JsonDiffOperation.Remove)
-            self.assertEqual(after_value_e.path, b"$.ab")
-            self.assertEqual(after_value_e.value, None)
+            after_value_e: JsonDiffVector = event.rows[0]["after_values"]["e"]
+            self.assertIsInstance(after_value_e, JsonDiffVector)
+            self.assertEqual(after_value_e[0].op, JsonDiffOperation.Remove)
+            self.assertEqual(after_value_e[0].path, b"$.ab")
+            self.assertEqual(after_value_e[0].value, None)
 
             after_none_sources = event.rows[0].get("after_none_sources")
             self.assertEqual(after_none_sources["c"], NONE_SOURCE.JSON_PARTIAL_UPDATE)
@@ -2271,18 +2282,89 @@ class TestJsonPartialUpdate(base.PyMySQLReplicationTestCase):
                     b"ab": [b"abababababababa", b"babababababab"],
                 },
             ),
-            after_value_d: JsonDiff = event.rows[0]["after_values"]["d"]
-            self.assertEqual(after_value_d.op, JsonDiffOperation.Replace)
-            self.assertEqual(after_value_d.path, b"$.ab")
-            self.assertEqual(after_value_d.value, b'["ab_ddd"]')
+            after_value_d: JsonDiffVector = event.rows[0]["after_values"]["d"]
+            self.assertIsInstance(after_value_d, JsonDiffVector)
+            self.assertEqual(after_value_d[0].op, JsonDiffOperation.Replace)
+            self.assertEqual(after_value_d[0].path, b"$.ab")
+            self.assertEqual(after_value_d[0].value, b'["ab_ddd"]')
 
-            after_value_e: JsonDiff = event.rows[0]["after_values"]["e"]
-            self.assertEqual(after_value_e.op, JsonDiffOperation.Remove)
-            self.assertEqual(after_value_e.path, b"$.ab")
-            self.assertEqual(after_value_e.value, None)
+            after_value_e: JsonDiffVector = event.rows[0]["after_values"]["e"]
+            self.assertIsInstance(after_value_e, JsonDiffVector)
+            self.assertEqual(after_value_e[0].op, JsonDiffOperation.Remove)
+            self.assertEqual(after_value_e[0].path, b"$.ab")
+            self.assertEqual(after_value_e[0].value, None)
 
             after_none_sources = event.rows[0].get("after_none_sources")
             self.assertEqual(after_none_sources["c"], NONE_SOURCE.JSON_PARTIAL_UPDATE)
+
+    def test_json_partial_update_materialized_mode(self):
+        drop_table_if_exists_query = "DROP TABLE IF EXISTS test_json_v2;"
+        create_query = "CREATE TABLE test_json_v2 (id INT, c JSON,PRIMARY KEY (id)) ;"
+        insert_query = (
+            "INSERT INTO test_json_v2 VALUES "
+            "(201, '{\"a\":1, \"ab\":[\"x\", \"y\"]}');"
+        )
+        update_query = (
+            "UPDATE test_json_v2 SET c = JSON_REMOVE(c, '$.ab[0]') WHERE id = 201;"
+        )
+
+        self.stream.close()
+        self.stream = BinLogStreamReader(
+            self.database,
+            server_id=1025,
+            only_events=(PartialUpdateRowsEvent,),
+            json_update_mode=JsonUpdateMode.MATERIALIZED,
+        )
+        self.execute(drop_table_if_exists_query)
+        self.execute(create_query)
+        self.execute(insert_query)
+        self.execute(update_query)
+        self.execute("COMMIT;")
+        event = self.stream.fetchone()
+
+        if event.table_map[event.table_id].column_name_flag:
+            after_c = event.rows[0]["after_values"]["c"]
+            # Complete materialized after document, not a vector or NULL.
+            self.assertEqual(after_c, {b"a": 1, b"ab": [b"y"]})
+            # The before base document is unchanged.
+            self.assertEqual(
+                event.rows[0]["before_values"]["c"],
+                {b"a": 1, b"ab": [b"x", b"y"]},
+            )
+
+    def test_json_partial_update_both_mode_keeps_vector_and_materialized(self):
+        drop_table_if_exists_query = "DROP TABLE IF EXISTS test_json_v2;"
+        create_query = "CREATE TABLE test_json_v2 (id INT, c JSON,PRIMARY KEY (id)) ;"
+        insert_query = (
+            "INSERT INTO test_json_v2 VALUES "
+            "(301, '{\"a\":1}');"
+        )
+        update_query = (
+            "UPDATE test_json_v2 SET c = JSON_SET(c, '$.n', 'v') WHERE id = 301;"
+        )
+
+        self.stream.close()
+        self.stream = BinLogStreamReader(
+            self.database,
+            server_id=1026,
+            only_events=(PartialUpdateRowsEvent,),
+            json_update_mode=JsonUpdateMode.BOTH,
+        )
+        self.execute(drop_table_if_exists_query)
+        self.execute(create_query)
+        self.execute(insert_query)
+        self.execute(update_query)
+        self.execute("COMMIT;")
+        event = self.stream.fetchone()
+
+        if event.table_map[event.table_id].column_name_flag:
+            after_c: JsonDiffVector = event.rows[0]["after_values"]["c"]
+            self.assertIsInstance(after_c, JsonDiffVector)
+            self.assertEqual(after_c[0].op, JsonDiffOperation.Replace)
+            self.assertEqual(
+                event.rows[0]["after_values"]["c.materialized"],
+                {b"a": 1, b"n": b"v"},
+            )
 
 
 if __name__ == "__main__":

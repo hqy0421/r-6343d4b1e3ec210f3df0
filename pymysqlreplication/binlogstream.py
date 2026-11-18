@@ -191,6 +191,7 @@ class BinLogStreamReader(object):
         verify_checksum=False,
         enable_logging=True,
         use_column_name_cache=False,
+        json_update_mode=None,
     ):
         """
         Attributes:
@@ -235,6 +236,12 @@ class BinLogStreamReader(object):
                             When set to False, logging is disabled to enhance performance.
             use_column_name_cache: If true, enables caching of column names from INFORMATION_SCHEMA
                             for MySQL 5.7 compatibility when binlog metadata is missing. Default is False.
+            json_update_mode: How partial JSON updates (MySQL 8.0 PARTIAL_JSON) are exposed.
+                            A JsonUpdateMode value (DELTA, MATERIALIZED or BOTH). DELTA (the
+                            default) keeps ordered JsonDiffVector deltas and never queries the
+                            database to guess a base document. MATERIALIZED rebuilds the complete
+                            after JSON from the same row's before document when available; deltas
+                            without a base stay explicit pending-materialization objects.
         """
 
         self.__connection_settings = connection_settings
@@ -261,6 +268,7 @@ class BinLogStreamReader(object):
         self.__optional_meta_data = False
         self.__enable_logging = enable_logging
         self.__use_column_name_cache = use_column_name_cache
+        self.__json_update_mode = json_update_mode
 
         # We can't filter on packet level TABLE_MAP and rotate event because
         # we need them for handling other operations
@@ -649,6 +657,7 @@ class BinLogStreamReader(object):
                 self.__enable_logging,
                 self.__use_column_name_cache,
                 self.__post_header_lengths,
+                self.__json_update_mode,
             )
 
             if binlog_event.event_type == ROTATE_EVENT:

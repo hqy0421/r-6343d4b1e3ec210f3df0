@@ -14,6 +14,7 @@ from .constants import NONE_SOURCE
 from .column import Column
 from .table import Table
 from .bitmap import BitCount, BitGet
+from .json_binary import JsonDiffVector, JsonUpdateMode
 
 
 
@@ -361,8 +362,19 @@ class RowsEvent(BinLogEvent):
             return self.packet.read_length_coded_pascal_string(column.length_size)
         elif column.type == FIELD_TYPE.JSON:
             value = self.packet.read_binary_json(column.length_size, is_partial)
-            if not value and is_partial:
-                self.__none_sources[column.name] = NONE_SOURCE.JSON_PARTIAL_UPDATE
+            if is_partial:
+                if value is None:
+                    # A partial-flagged JSON column with a zero-length payload
+                    # is MySQL's "unchanged, same as before" marker. It is
+                    # neither SQL NULL (handled by the null bitmap above) nor a
+                    # length-prefixed empty diff vector (parsed as an empty
+                    # JsonDiffVector below).
+                    self.__none_sources[column.name] = (
+                        NONE_SOURCE.JSON_PARTIAL_UPDATE
+                    )
+                else:
+                    # A real (possibly empty) diff vector is present.
+                    self.__none_sources.pop(column.name, None)
             return value
         else:
             raise NotImplementedError(f"Unknown MySQL column type: {column.type}")
@@ -1265,6 +1277,52 @@ class PartialUpdateRowsEvent(UpdateRowsEvent):
     def __init__(self, from_packet, event_size, table_map, ctl_connection, **kwargs):
         super().__init__(from_packet, event_size, table_map, ctl_connection, **kwargs)
 
+    def _materialize_json_after_values(self, row):
+        """Apply each partial JSON column's ordered diffs to the same row's
+        complete before document.
+
+        Guarantees:
+          * every operation observes the effects of preceding operations;
+          * the before document (base) is never mutated;
+          * a vector without a usable base stays an explicit pending delta,
+            never a faked complete JSON document or SQL NULL;
+          * any failure aborts the whole row: no base is changed and no
+            half-materialized row is delivered.
+        """
+        mode = self._json_update_mode or JsonUpdateMode.DELTA
+        if mode not in (JsonUpdateMode.MATERIALIZED, JsonUpdateMode.BOTH):
+            return row
+
+        before_values = row["before_values"]
+        after_values = row["after_values"]
+        # Build the replacement image first; only commit it once every column
+        # has been processed successfully.
+        materialized_after = dict(after_values)
+        extra = {}
+        pending = {}
+        for name, value in after_values.items():
+            if not isinstance(value, JsonDiffVector):
+                continue
+            base = before_values.get(name)
+            if base is None:
+                # No complete before document to use as a base. Keep the
+                # explicit pending delta instead of inventing a value or a
+                # SQL NULL, and record why it is not a complete JSON document.
+                pending[name] = NONE_SOURCE.JSON_PENDING_MATERIALIZATION
+                continue
+            resolved = value.materialize(base)
+            if mode == JsonUpdateMode.MATERIALIZED:
+                materialized_after[name] = resolved.materialized
+            else:
+                extra[f"{name}.materialized"] = resolved.materialized
+        materialized_after.update(extra)
+        # Commit only after every column either materialized or was recorded
+        # as an explicit pending delta.
+        row["after_values"] = materialized_after
+        if pending:
+            row.setdefault("after_none_sources", {}).update(pending)
+        return row
+
     def _fetch_one_row(self):
         row = {}
         row_image_type = RowImageType.UpdateBI
@@ -1277,6 +1335,7 @@ class PartialUpdateRowsEvent(UpdateRowsEvent):
             self.columns_present_bitmap2, row_image_type
         )
         row["after_none_sources"] = self._get_none_sources(row["after_values"])
+        self._materialize_json_after_values(row)
 
         return row
 

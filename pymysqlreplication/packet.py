@@ -1,5 +1,8 @@
 from pymysqlreplication import constants, event, row_event
-from pymysqlreplication.json_binary import parse_json, JsonDiff, JsonDiffOperation
+from pymysqlreplication.json_binary import (
+    parse_json,
+    parse_json_diff_vector,
+)
 from pymysqlreplication.util.bytes import *
 from pymysqlreplication.constants import BINLOG
 
@@ -77,6 +80,7 @@ class BinLogPacketWrapper(object):
         enable_logging,
         use_column_name_cache=False,
         post_header_lengths=None,
+        json_update_mode=None,
     ):
         # -1 because we ignore the ok byte
         self.read_bytes = 0
@@ -136,6 +140,7 @@ class BinLogPacketWrapper(object):
             use_column_name_cache=use_column_name_cache,
             use_checksum=use_checksum,
             post_header_lengths=post_header_lengths,
+            json_update_mode=json_update_mode,
         )
         if not self.event._processed:
             self.event = None
@@ -349,30 +354,23 @@ class BinLogPacketWrapper(object):
     def read_binary_json(self, size, is_partial):
         """
         Refer https://github.com/go-mysql-org/go-mysql/blob/master/replication/json_binary.go
+
+        A non-partial JSON column is a single binary JSON document.
+
+        A partial JSON column (MySQL 8.0 PARTIAL_JSON row value option) is a
+        length-prefixed binary diff vector containing an ordered, possibly
+        empty sequence of operations. The whole vector is decoded up front:
+        any bad length, unknown operation, truncated payload or bad path
+        raises JsonBinaryParseError before the packet cursor is advanced past
+        the column, so a corrupt column cannot shift subsequent columns.
         """
         length = self.read_uint_by_size(size)
         if length == 0:
-            # handle NULL value
+            # SQL NULL
             return None
         data = self.read(length)
         if is_partial:
-            operation_number = data[0]
-            json_operation = JsonDiffOperation.by_index(operation_number)
-            data = data[1:]
-            path_length, _, n = length_encoded_int(data)
-            data = data[n:]
-
-            path = data[:path_length]
-            data = data[path_length:]
-
-            value_length, _, n = length_encoded_int(data)
-            if json_operation == JsonDiffOperation.Remove:
-                return JsonDiff(json_operation, path)
-
-            data = data[n:]
-            data = data[:value_length]
-            data = parse_json(data[0], data[1:])
-            return JsonDiff(json_operation, path, data)
+            return parse_json_diff_vector(data)
         return parse_json(data[0], data[1:])
 
     def read_string(self):
